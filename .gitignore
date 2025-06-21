@@ -1,0 +1,12 @@
+# secrets & backups
+.env
+backups/
+# docker named volumes (when bind‑mounted for debug)
+wg-data/
+pg-data/
+# IDE & Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.vscode/
+.idea/

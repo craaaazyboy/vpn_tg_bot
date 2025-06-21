@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+  # WireGuard-демон (контейнер linuxserver/wireguard)
+  wg:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: wg
+    network_mode: host               # ⬅ нужен host-net, иначе 49735/udp не откроется
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    environment:
+      PUID: 0
+      PGID: 0
+      TZ: Europe/Moscow
+      SERVERURL: ${WG_HOST}          # 77.221.145.27 или DNS-имя
+      SERVERPORT: ${WG_PORT:-49735}
+      PEERS: none                    # пиры уже в wg0.conf
+      PEERDNS: 1.1.1.1
+    volumes:
+      - wg-data:/config              # live-файлы wg0.conf
+      - /lib/modules:/lib/modules:ro
+    restart: unless-stopped
+
+  wg-api:
+    image: leonovk/wg-rest-api:latest
+    container_name: wg-api
+    network_mode: host               # ⬅ обязательно
+    privileged: true                 # ⬅ /dev/net/tun + CAP_NET_ADMIN
+    environment:
+      WG_INTERFACE_NAME: wg0
+      WG_AUTO_APPLY: "true"          # ⬅ мгновенно делает `wg set …`
+      WG_HOST: ${WG_HOST}
+      WG_PORT: ${WG_PORT:-49735}
+      WG_DEFAULT_ADDRESS: 10.66.66.x
+      AUTH_TOKEN: ${WG_JWT}
+    volumes:
+      - wg-data:/etc/wireguard
+    depends_on: [wg]
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: vpn-db
+    environment:
+      POSTGRES_DB: bot
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASS}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  bot:
+    build: ./bot
+    container_name: bot
+    network_mode: host
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_ID: ${ADMIN_ID}
+      WG_API_URL: http://127.0.0.1:3000
+      WG_JWT: ${WG_JWT}
+      DATABASE_URL: postgresql://${PG_USER}:${PG_PASS}@postgres:5432/bot
+    depends_on: [db, wg-api]
+    restart: unless-stopped
+
+volumes:
+  wg-data:
+  pg-data:
