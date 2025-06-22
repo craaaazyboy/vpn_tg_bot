@@ -1,17 +1,20 @@
 version: "3.9"
 services:
-  postgres:
-    image: postgres:16-alpine
+  wg-rest-api:
+    image: leonovk/wg-rest-api:latest
+    container_name: wg-rest-api
+    restart: unless-stopped
     environment:
-      - POSTGRES_DB=bot
-      - POSTGRES_USER=${PG_USER}
-      - POSTGRES_PASSWORD=${PG_PASS}
-    volumes: [pg-data:/var/lib/postgresql/data]
-
-  bot:
-    build: ./bot
-    env_file: .env
-    depends_on: [postgres]
-
-volumes:
-  pg-data:
+      WG_INTERFACE_NAME: wg0
+      WG_PORT: 51194
+      WG_DEFAULT_ADDRESS: 192.168.15.x
+      WG_DEFAULT_DNS: 1.1.1.1
+      WG_HOST: "77.221.145.27"
+      AUTH_TOKEN: "LONG_RANDOM_TOKEN"
+      WG_AUTO_APPLY: "true"
+      ENVIRONMENT: "production"
+    volumes:
+      - /etc/wireguard:/etc/wireguard
+    network_mode: host
+    cap_add:
+      - NET_ADMIN

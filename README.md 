@@ -1,0 +1,131 @@
+# VPN-TG-Bot 🛡️
+
+Телеграм-бот, через который администратор одним кликом
+выдаёт пользователям конфиг WireGuard (QR + `.conf`).  
+Вся инфраструктура упакована в **один `docker-compose.yml`**:
+поднимает VPN-демон, REST-API, Postgres и бот.
+
+| сервис   | образ / язык                    | роль                                               |
+|----------|---------------------------------|----------------------------------------------------|
+| **wg**   | `lscr.io/linuxserver/wireguard` | Поднимает интерфейс `wg0`, слушает UDP-порт VPN    |
+| **api**  | `leonovk/wg-rest-api`           | REST-обёртка, генерирует peer и сразу «шьёт» в `wg0` |
+| **db**   | `postgres:16-alpine`            | Хранит журнал «кто-какой peer получил»             |
+| **bot**  | `python:3.12-slim` + aiogram    | Telegram-бот с кнопками ✅ / ❌                     |
+
+---
+
+## 📂 Структура репозитория
+
+vpn-tg-bot/
+├─ bot/ ← исходники бота
+│ ├─ main.py
+│ ├─ db.py
+│ ├─ state.py
+│ ├─ models.py
+│ ├─ requirements.txt
+│ └─ Dockerfile
+├─ docker-compose.yml ← единый стек (wg + api + db + bot)
+├─ .env.example ← шаблон переменных окружения
+├─ backup.sh ← резерв wg0.conf
+└─ README.md
+
+yaml
+Копировать
+Редактировать
+
+---
+
+## ⚙️ Переменные окружения
+
+Скопируй `.env.example` → `.env` и заполни.
+
+| переменная            | пример                    | назначение                                   |
+|-----------------------|---------------------------|----------------------------------------------|
+| `WG_HOST`             | `vpn.example.com`         | внешний DNS/IP сервера                       |
+| `WG_PORT`             | `49735`                   | UDP-порт WireGuard (должен совпадать в `wg0.conf`) |
+| `WG_JWT`              | `LONG_RANDOM_TOKEN`       | общий токен (бот ↔ REST-API)                 |
+| `BOT_TOKEN`           | `123456:ABC...`           | токен Telegram-бота                          |
+| `ADMIN_ID`            | `111,222`                 | ID админов через запятую                     |
+| `PG_USER` / `PG_PASS` | `bot` / `secret`          | учётка Postgres                              |
+| `WG_API_URL`          | `http://127.0.0.1:3000`   | бот обращается сюда (локальный REST-API)     |
+
+---
+
+## 🚀 Развёртывание на сервере
+
+```bash
+# 0) Убедись, что Docker + Compose v2 установлены
+git clone https://github.com/<you>/vpn-tg-bot.git
+cd vpn-tg-bot
+cp .env.example .env        # отредактируй значения
+
+# 1) Перенести старый конфиг, если сервер уже работал:
+sudo mkdir -p data/wireguard
+sudo cp -a /etc/wireguard/* data/wireguard/
+
+# 2) Поднять стек
+docker compose pull           # wg, api, postgres
+docker compose build bot      # собираем Python-бота
+docker compose up -d          # старт всех контейнеров
+docker compose ps             # все должны быть Up
+Проверка:
+
+bash
+Копировать
+Редактировать
+curl 127.0.0.1:3000/healthz     # {"status":"ok", ...}
+wg show wg0                     # интерфейс поднят
+💻 Локальный запуск (без WireGuard)
+Чтобы разрабатывать бота на ноутбуке, достаточно Postgres + bot.
+
+Создай файл .env.local
+(укажи WG_API_URL=http://<prod-ip>:3000).
+
+Запусти только нужные сервисы:
+
+bash
+Копировать
+Редактировать
+docker compose --env-file .env.local up -d db bot
+Бот будет обращаться к удалённому REST-API.
+
+🛠️ Пользование
+Пользователь отправляет /new, вводит имя устройства.
+
+Админу прилетает запрос.
+
+При нажатии ✅ бот:
+
+создаёт peer через REST (POST /api/clients);
+
+получает QR + .conf;
+
+сохраняет запись в таблицу peers;
+
+отправляет файлы пользователю.
+
+REST-API сразу выполняет
+wg set wg0 peer … allowed-ips 10.66.66.N/32
+→ peer мгновенно виден в wg show wg0.
+
+🔄 Обновление
+bash
+Копировать
+Редактировать
+git pull
+docker compose pull        # свежие образы
+docker compose build bot   # если код бота менялся
+docker compose up -d
+💾 Резервная копия
+Скрипт backup.sh копирует data/wireguard в backup/:
+
+bash
+Копировать
+Редактировать
+0 3 * * * root /opt/vpn-tg-bot/backup.sh
+❓ FAQ
+вопрос	ответ
+Как сменить диапазон IP?	В .env → WG_DEFAULT_ADDRESS=10.8.0.x, затем docker compose up -d — новые peers пойдут из нового пула.
+Удалить peer?	curl -X DELETE -H"Authorization: Bearer $WG_JWT" 127.0.0.1:3000/api/clients/<id>
+Порт 49735 уже занят	Поменяй WG_PORT в .env и в файрволе.
+Бот пишет “Cannot connect to host …3000”	Убедись, что WG_API_URL внутри контейнера указывает на REST-API (127.0.0.1:3000 или 172.17.0.1:3000).

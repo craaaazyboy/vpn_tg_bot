@@ -1,8 +1,8 @@
-from __future__ import annotations
-import asyncio, io, logging, os
+import asyncio
+import logging
+import os
 from typing import Final
-
-import aiohttp
+import asyncssh
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -12,38 +12,23 @@ from aiogram.types import (
     BufferedInputFile,
 )
 
-import db
 from state import RequestPeer
 
 # ────────── env ────────────────────────────────────────────────────────────
 BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS: Final[list[int]] = [int(i) for i in
-                               os.getenv("ADMIN_ID", "").split(",") if i]
-WG_URL:  Final[str] = os.getenv("WG_API_URL", "http://wg-api:3000").rstrip("/")
-WG_JWT:  Final[str] = os.getenv("WG_JWT", "").strip()
-auth_headers = {"Authorization": f"Bearer {WG_JWT}"}
+ADMIN_IDS: Final[list[int]] = [int(i) for i in os.getenv("ADMIN_ID", "").split(",") if i]
+WG_SSH_HOST: Final[str] = os.getenv("WG_SSH_HOST")
+WG_SSH_USER: Final[str] = os.getenv("WG_SSH_USER", "root")
+WG_SSH_KEY: Final[str] = os.getenv("WG_SSH_KEY", "/run/secrets/vpn_ssh_key")
 
 # ────────── aiogram init ───────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp  = Dispatcher()
-rt  = Router()
+dp = Dispatcher()
+rt = Router()
 dp.include_router(rt)
-
-# ────────── REST helpers ───────────────────────────────────────────────────
-async def api_create_peer(name: str) -> dict:
-    async with aiohttp.ClientSession(headers=auth_headers) as s:
-        async with s.post(f"{WG_URL}/api/clients", json={"name": name}) as r:
-            r.raise_for_status()
-            return await r.json()
-
-async def api_get_file(peer_id: int, fmt: str) -> bytes | str:
-    async with aiohttp.ClientSession(headers=auth_headers) as s:
-        async with s.get(f"{WG_URL}/api/clients/{peer_id}?format={fmt}") as r:
-            r.raise_for_status()
-            return await (r.read() if fmt == "qr" else r.text())
 
 # ────────── user flow ──────────────────────────────────────────────────────
 @rt.message(Command("start"))
@@ -61,10 +46,8 @@ async def got_name(m: Message, state: RequestPeer):
     await state.clear()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить",
-                             callback_data=f"ok|{m.from_user.id}|{name}"),
-        InlineKeyboardButton(text="❌ Отклонить",
-                             callback_data=f"no|{m.from_user.id}")
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"ok|{m.from_user.id}|{name}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no|{m.from_user.id}")
     ]])
 
     for admin in ADMIN_IDS:
@@ -75,6 +58,34 @@ async def got_name(m: Message, state: RequestPeer):
             reply_markup=kb)
 
     await m.answer("Запрос отправлен администратору, ждите решения.")
+
+async def get_next_free_ip(conn) -> int:
+    """
+    Парсим конфиг-файл напрямую, чтобы гарантированно получить последний IP.
+    """
+    result = await conn.run(
+        "grep 'AllowedIPs' /etc/wireguard/wg0.conf | "
+        "grep -oP '10\\.66\\.66\\.\\K\\d+' | "
+        "sort -n | tail -1", check=False
+    )
+    last_ip = result.stdout.strip()
+    if last_ip.isdigit():
+        return int(last_ip) + 1
+    return 2  # начальный IP, если конфиг пуст
+
+
+async def ssh_addconf(device_name: str) -> None:
+    logging.info("📡 SSH: добавляем пир '%s'", device_name)
+    async with asyncssh.connect(
+        WG_SSH_HOST,
+        username=WG_SSH_USER,
+        client_keys=[WG_SSH_KEY],
+        known_hosts=None,
+    ) as conn:
+        next_ip = await get_next_free_ip(conn)
+        cmd = f"printf '1\n{device_name}\n{next_ip}\n{next_ip}\n' | bash ~/wireguard-install.sh"
+        result = await conn.run(cmd, check=True)
+        logging.info("✅ wireguard-install output:\n%s", result.stdout)
 
 # ────────── admin buttons ──────────────────────────────────────────────────
 @rt.callback_query(F.data.regexp(r"^(ok|no)\|"))
@@ -89,25 +100,32 @@ async def admin_decision(cb: CallbackQuery):
 
     device_name = rest[0]
 
-    # создаём peer
-    peer = await api_create_peer(device_name)
-    peer_id = int(peer["id"])
+    await ssh_addconf(device_name)
 
-    # качаем файлы
-    qr    = await api_get_file(peer_id, "qr")
-    conf  = await api_get_file(peer_id, "conf")
+    async with asyncssh.connect(
+        WG_SSH_HOST,
+        username=WG_SSH_USER,
+        client_keys=[WG_SSH_KEY],
+        known_hosts=None,
+    ) as conn:
+        conf_path = f"/root/wg0-client-{device_name}.conf"
 
-    # сохраняем в БД
-    await db.save_peer(user_id, device_name, peer_id)
+        result = await conn.run(f"cat {conf_path}", check=True)
+        conf_data = result.stdout
 
-    # отправка пользователю
+        # Здесь добавляем encoding=None для бинарного файла
+        qr_result = await conn.run(f"qrencode -t png -o - < {conf_path}", encoding=None, check=True)
+        qr_bytes = qr_result.stdout  # теперь правильно получаем bytes напрямую
+
     await bot.send_photo(
         user_id,
-        BufferedInputFile(qr, filename="qr.png"),
-        caption=f"Туннель <b>{device_name}</b>.\nСканируйте QR в WireGuard.")
+        BufferedInputFile(qr_bytes, filename="qr.png"),
+        caption=f"Туннель <b>{device_name}</b>.\nСканируйте QR в WireGuard."
+    )
     await bot.send_document(
         user_id,
-        BufferedInputFile(conf.encode(), filename=f"{device_name}.conf"))
+        BufferedInputFile(conf_data.encode(), filename=f"{device_name}.conf")
+    )
 
     await cb.answer("Профиль создан!")
 
