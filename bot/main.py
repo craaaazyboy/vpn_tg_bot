@@ -1,3 +1,4 @@
+import html
 import asyncio
 import logging
 import os
@@ -46,8 +47,8 @@ async def got_name(m: Message, state: RequestPeer):
     await state.clear()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"ok|{m.from_user.id}|{name}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no|{m.from_user.id}")
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"ok|{m.from_user.id}|{name}|{m.from_user.full_name}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no|{m.from_user.id}|{name}|{m.from_user.full_name}")
     ]])
 
     for admin in ADMIN_IDS:
@@ -93,12 +94,28 @@ async def admin_decision(cb: CallbackQuery):
     action, uid, *rest = cb.data.split("|")
     user_id = int(uid)
 
+
+    # 1) берём raw_name только если это OK, иначе default
+    device_name = rest[0]
+    user_name = rest[1]
+    # 3) отвечаем на callback — убираем крутилку
+    await cb.answer(text="Одобрено" if action == "ok" else "Отклонено")
+
+    # 4) редактируем сообщение в админском чате (удаляем клавиатуру)
+    decision_text = "✅ Одобрено" if action == "ok" else "❌ Отклонено"
+    new_text = (
+        f"<b>Запрос VPN</b>\n"
+        f"👤 <a href=\"tg://user?id={user_id}\">{user_name}</a>\n"
+        f"💻 <code>{device_name}</code>\n\n"
+        f"{decision_text}"
+    )
+
+    await cb.message.edit_text(new_text, parse_mode="HTML")
+
     if action == "no":
         await bot.send_message(user_id, "Администратор отклонил запрос.")
         await cb.answer("Отклонено")
         return
-
-    device_name = rest[0]
 
     await ssh_addconf(device_name)
 
@@ -130,8 +147,18 @@ async def admin_decision(cb: CallbackQuery):
     await cb.answer("Профиль создан!")
 
 # ────────── run ────────────────────────────────────────────────────────────
+# ────────── run ────────────────────────────────────────────────────────────
 async def main():
-    await dp.start_polling(bot)
+    # 1) снимаем веб-хук
+    ok = await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("delete_webhook → %s", ok)
+
+    info = await bot.get_webhook_info()
+    logging.info("WebhookInfo после delete: %s", info)
+
+    # 2) запускаем polling
+    await dp.start_polling(bot, skip_updates=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
