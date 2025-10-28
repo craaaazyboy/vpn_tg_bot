@@ -1,163 +1,151 @@
-import html
 import asyncio
 import logging
-import os
-from typing import Final
-import asyncssh
-from aiogram import Bot, Dispatcher, F, Router
+
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
     BufferedInputFile,
 )
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
 
+from settings import settings
+from handlers import user as user_handlers
+from handlers import admin as admin_handlers
 from state import RequestPeer
+from services.wireguard import add_peer, fetch_client_conf_and_qr
+from db import insert_peer, upsert_user
 
-# ────────── env ────────────────────────────────────────────────────────────
-BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS: Final[list[int]] = [int(i) for i in os.getenv("ADMIN_ID", "").split(",") if i]
-WG_SSH_HOST: Final[str] = os.getenv("WG_SSH_HOST")
-WG_SSH_USER: Final[str] = os.getenv("WG_SSH_USER", "root")
-WG_SSH_KEY: Final[str] = os.getenv("WG_SSH_KEY", "/run/secrets/vpn_ssh_key")
 
-# ────────── aiogram init ───────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+# ──────────────────────────── Логирование ────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+# ──────────────────────── Инициализация бота ─────────────────────────────
+bot = Bot(
+    settings.BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher(storage=MemoryStorage())
+
+# ──────────────────────────── Роутеры ────────────────────────────────────
 rt = Router()
-dp.include_router(rt)
+dp.include_router(user_handlers.rt)
+dp.include_router(admin_handlers.rt)
+dp.include_router(rt)  # временно: старые хендлеры тут
 
-# ────────── user flow ──────────────────────────────────────────────────────
-@rt.message(Command("start"))
-async def cmd_start(m: Message):
-    await m.answer("Привет! Отправь /new, чтобы запросить VPN-профиль.")
 
+# ───────────────────────────── Хендлеры ──────────────────────────────────
 @rt.message(Command("new"))
 async def cmd_new(m: Message, state: RequestPeer):
+    await upsert_user(
+        m.from_user.id,
+        m.from_user.username,
+        m.from_user.first_name,
+        m.from_user.last_name,
+    )
     await m.answer("Как назвать устройство? <code>MacBook-Air</code> и т.д.")
     await state.set_state(RequestPeer.waiting_name)
 
-@rt.message(RequestPeer.waiting_name, F.text.len() > 1)
+
+@rt.message(RequestPeer.waiting_name, F.text)
 async def got_name(m: Message, state: RequestPeer):
     name = m.text.strip()
     await state.clear()
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"ok|{m.from_user.id}|{name}|{m.from_user.full_name}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no|{m.from_user.id}|{name}|{m.from_user.full_name}")
-    ]])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить",
+                    callback_data=f"ok|{m.from_user.id}|{name}|{m.from_user.full_name}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"no|{m.from_user.id}|{name}|{m.from_user.full_name}",
+                ),
+            ]
+        ]
+    )
 
-    for admin in ADMIN_IDS:
+    for admin in settings.ADMIN_IDS:
         await bot.send_message(
             admin,
-            f"<b>Запрос VPN</b>\n👤 <a href=\"tg://user?id={m.from_user.id}\">"
-            f"{m.from_user.full_name}</a>\n💻 <code>{name}</code>",
-            reply_markup=kb)
+            (
+                f"<b>Запрос VPN</b>\n"
+                f"👤 <a href=\"tg://user?id={m.from_user.id}\">{m.from_user.full_name}</a>\n"
+                f"💻 <code>{name}</code>"
+            ),
+            reply_markup=kb,
+        )
 
     await m.answer("Запрос отправлен администратору, ждите решения.")
 
-async def get_next_free_ip(conn) -> int:
-    """
-    Парсим конфиг-файл напрямую, чтобы гарантированно получить последний IP.
-    """
-    result = await conn.run(
-        "grep 'AllowedIPs' /etc/wireguard/wg0.conf | "
-        "grep -oP '10\\.66\\.66\\.\\K\\d+' | "
-        "sort -n | tail -1", check=False
-    )
-    last_ip = result.stdout.strip()
-    if last_ip.isdigit():
-        return int(last_ip) + 1
-    return 2  # начальный IP, если конфиг пуст
 
-
-async def ssh_addconf(device_name: str) -> None:
-    logging.info("📡 SSH: добавляем пир '%s'", device_name)
-    async with asyncssh.connect(
-        WG_SSH_HOST,
-        username=WG_SSH_USER,
-        client_keys=[WG_SSH_KEY],
-        known_hosts=None,
-    ) as conn:
-        next_ip = await get_next_free_ip(conn)
-        cmd = f"printf '1\n{device_name}\n{next_ip}\n{next_ip}\n' | bash ~/wireguard-install.sh"
-        result = await conn.run(cmd, check=True)
-        logging.info("✅ wireguard-install output:\n%s", result.stdout)
-
-# ────────── admin buttons ──────────────────────────────────────────────────
-@rt.callback_query(F.data.regexp(r"^(ok|no)\|"))
+@rt.callback_query(F.data.startswith(("ok|", "no|")))
 async def admin_decision(cb: CallbackQuery):
-    action, uid, *rest = cb.data.split("|")
-    user_id = int(uid)
+    try:
+        action, uid, device_name, user_name = cb.data.split("|")
+        user_id = int(uid)
+
+        await cb.answer("Одобрено" if action == "ok" else "Отклонено")
+
+        new_text = (
+            f"<b>Запрос VPN</b>\n"
+            f"👤 <a href=\"tg://user?id={user_id}\">{user_name}</a>\n"
+            f"💻 <code>{device_name}</code>\n\n"
+            f"{'✅ Одобрено' if action == 'ok' else '❌ Отклонено'}"
+        )
+        await cb.message.edit_text(new_text)
+
+        if action == "no":
+            await bot.send_message(user_id, "Администратор отклонил запрос.")
+            return
+
+        # ── Создание пира через WireGuard и запись в БД
+        pubkey, ip_oct, cidr, conf_path = await add_peer(device_name)
+        await insert_peer(user_id, device_name, pubkey, ip_oct, cidr, conf_path)
+
+        conf_text, qr_png = await fetch_client_conf_and_qr(conf_path)
+
+        await bot.send_photo(
+            user_id,
+            BufferedInputFile(qr_png, filename="qr.png"),
+            caption=f"Туннель <b>{device_name}</b>. Сканируйте QR в WireGuard.",
+        )
+        await bot.send_document(
+            user_id,
+            BufferedInputFile(conf_text.encode(), filename=f"{device_name}.conf"),
+        )
+
+        await cb.answer("Профиль создан!")
+    except Exception as e:
+        logging.exception(f"Ошибка при обработке решения администратора: {e}")
+        await cb.answer("Произошла ошибка.", show_alert=True)
 
 
-    # 1) берём raw_name только если это OK, иначе default
-    device_name = rest[0]
-    user_name = rest[1]
-    # 3) отвечаем на callback — убираем крутилку
-    await cb.answer(text="Одобрено" if action == "ok" else "Отклонено")
-
-    # 4) редактируем сообщение в админском чате (удаляем клавиатуру)
-    decision_text = "✅ Одобрено" if action == "ok" else "❌ Отклонено"
-    new_text = (
-        f"<b>Запрос VPN</b>\n"
-        f"👤 <a href=\"tg://user?id={user_id}\">{user_name}</a>\n"
-        f"💻 <code>{device_name}</code>\n\n"
-        f"{decision_text}"
-    )
-
-    await cb.message.edit_text(new_text, parse_mode="HTML")
-
-    if action == "no":
-        await bot.send_message(user_id, "Администратор отклонил запрос.")
-        await cb.answer("Отклонено")
-        return
-
-    await ssh_addconf(device_name)
-
-    async with asyncssh.connect(
-        WG_SSH_HOST,
-        username=WG_SSH_USER,
-        client_keys=[WG_SSH_KEY],
-        known_hosts=None,
-    ) as conn:
-        conf_path = f"/root/wg0-client-{device_name}.conf"
-
-        result = await conn.run(f"cat {conf_path}", check=True)
-        conf_data = result.stdout
-
-        # Здесь добавляем encoding=None для бинарного файла
-        qr_result = await conn.run(f"qrencode -t png -o - < {conf_path}", encoding=None, check=True)
-        qr_bytes = qr_result.stdout  # теперь правильно получаем bytes напрямую
-
-    await bot.send_photo(
-        user_id,
-        BufferedInputFile(qr_bytes, filename="qr.png"),
-        caption=f"Туннель <b>{device_name}</b>.\nСканируйте QR в WireGuard."
-    )
-    await bot.send_document(
-        user_id,
-        BufferedInputFile(conf_data.encode(), filename=f"{device_name}.conf")
-    )
-
-    await cb.answer("Профиль создан!")
-
-# ────────── run ────────────────────────────────────────────────────────────
-# ────────── run ────────────────────────────────────────────────────────────
+# ───────────────────────────── main() ────────────────────────────────────
 async def main():
-    # 1) снимаем веб-хук
-    ok = await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("delete_webhook → %s", ok)
+    try:
+        logging.info("🔄 Удаляем вебхук и сбрасываем апдейты…")
+        await bot.delete_webhook(drop_pending_updates=True)
 
-    info = await bot.get_webhook_info()
-    logging.info("WebhookInfo после delete: %s", info)
+        me = await bot.get_me()
+        logging.info(f"✅ Бот @{me.username} ({me.id}) запущен и готов к работе")
 
-    # 2) запускаем polling
-    await dp.start_polling(bot, skip_updates=True)
+        logging.info("🚀 Запуск polling…")
+        await dp.start_polling(bot)
+
+    except Exception:
+        logging.exception("❌ Фатальная ошибка при запуске бота")
+        raise
 
 
 if __name__ == "__main__":

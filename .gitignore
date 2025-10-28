@@ -1,6 +1,7 @@
 # secrets & backups
 .env
 backups/
+secrets/
 # docker named volumes (when bind‑mounted for debug)
 wg-data/
 pg-data/
