@@ -16,7 +16,7 @@ services:
     depends_on: [db]
     restart: unless-stopped
     volumes:
-      - /home/crazy_boy/.ssh/id_ed25519:/run/secrets/vpn_ssh_key:ro
+      - ./secrets/id_ed25519:/run/secrets/vpn_ssh_key:ro
 
 volumes:
   pg-data:
