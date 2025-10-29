@@ -5,9 +5,9 @@ from utils.format import fmt_bytes, fmt_owner
 
 PAGE_SIZE = 10  # для навигации в подписях (если надо)
 
-def kb_peer_card_safe(tg_user: Optional[int], peer_id: int) -> InlineKeyboardMarkup:
+def kb_peer_card_safe(tg_user: Optional[int], peer_id: int, username: str) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    if tg_user:
+    if tg_user and username:
         rows.append([InlineKeyboardButton(text="💬 Написать", url=f"tg://user?id={tg_user}")])
     rows.append([
         InlineKeyboardButton(text="🔁 Отправить конфиг", callback_data=f"peer:resend:{peer_id}"),
