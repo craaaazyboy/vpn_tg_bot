@@ -501,3 +501,48 @@ async def list_peers_page(status: str, limit: int, offset: int):
             }
             for r in res.mappings().all()
         ]
+    
+
+async def list_user_peers(tg_user: int):
+    """
+    Вернёт устройства пользователя в прежнем формате dict-списка:
+    [{id, device_name, allowed_cidr, status, last_handshake}]
+    """
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Peer.id, Peer.device_name, Peer.allowed_cidr, Peer.status, Peer.last_handshake)
+            .where(Peer.tg_user == tg_user)
+            .order_by(Peer.id)
+        )
+        return [
+            {
+                "id": r.id,
+                "device_name": r.device_name,
+                "allowed_cidr": str(r.allowed_cidr) if r.allowed_cidr else None,
+                "status": r.status,
+                "last_handshake": r.last_handshake,
+            }
+            for r in res.mappings().all()
+        ]
+    
+async def get_peer_owned_by(peer_id: int, owner_tg_id: int):
+    """
+    Возвращает peer строго если он принадлежит owner_tg_id.
+    Формат dict совместим с карточками.
+    """
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(
+                Peer.id, Peer.tg_user, Peer.device_name, Peer.peer_pubkey, Peer.peer_ip_octet,
+                Peer.allowed_cidr, Peer.status, Peer.rx_bytes, Peer.tx_bytes,
+                Peer.last_handshake, Peer.conf_path, Peer.created_at, Peer.revoked_at, Peer.api_client_id
+            ).where(and_(Peer.id == peer_id, Peer.tg_user == owner_tg_id))
+        )
+        r = res.mappings().first()
+        if not r:
+            return None
+        # приводим к единообразию: строки/тип CIDR
+        d = dict(r)
+        if d.get("allowed_cidr") is not None:
+            d["allowed_cidr"] = str(d["allowed_cidr"])
+        return d
