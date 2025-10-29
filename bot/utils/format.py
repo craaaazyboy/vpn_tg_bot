@@ -14,7 +14,7 @@ def fmt_owner(tg_id, username, first_name, last_name) -> str:
     if tg_id:
         visible = (first_name or "") + (" " + last_name if last_name else "")
         visible = visible.strip() or (f"@{username}" if username else f"id:{tg_id}")
-        return f"<a href=\"tg://user?id={tg_id}\">{visible}</a>"
+        return f"{visible}"
     # неизвестный владелец
     if username or first_name or last_name:
         visible = (first_name or "") + (" " + (last_name or "")) + (f" @{username}" if username else "")
