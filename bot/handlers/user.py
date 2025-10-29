@@ -7,11 +7,11 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 
-from state import RequestPeer
+from state import RequestPeer, SupportDialog
 from keyboards import kb_user_main
 from db import (
     upsert_user, is_admin, create_access_request,
-    list_user_peers, get_peer_owned_by
+    list_user_peers, get_peer_owned_by, create_support_ticket, list_user_tickets, reply_ticket_from_user
 )
 from services.wireguard import fetch_client_conf_and_qr, wg_dump_stats
 from settings import settings
@@ -203,3 +203,124 @@ async def cmd_new(m: Message, state: FSMContext):
     await upsert_user(m.from_user.id, m.from_user.username, m.from_user.first_name, m.from_user.last_name)
     await m.answer("Как назвать устройство? <code>MacBook-Air</code> и т.д.")
     await state.set_state(RequestPeer.waiting_name)
+
+from aiogram import F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from state import SupportDialog
+from keyboards import (
+    kb_user_main, kb_user_support_home, kb_user_ticket_row, kb_user_ticket_actions
+)
+from services.support import render_user_ticket_text
+from db import upsert_user, list_user_tickets, create_support_ticket, reply_ticket_from_user, is_admin
+from settings import settings
+
+USER_PAGE_SIZE = 8
+
+# Вход в поддержку / кнопка в клавиатуре
+@rt.message(F.text.casefold() == "🆘 поддержка".casefold())
+async def user_support_home(m: Message):
+    await upsert_user(m.from_user.id, m.from_user.username, m.from_user.first_name, m.from_user.last_name)
+    # покажем первую страницу
+    await _user_support_list_send(m, page=1)
+
+async def _user_support_list_send(target, page: int):
+    # target: Message или CallbackQuery.message
+    rows = await list_user_tickets(target.chat.id if hasattr(target, "chat") else target.message.chat.id,
+                                   limit=USER_PAGE_SIZE, offset=(page-1)*USER_PAGE_SIZE)
+    total = len(rows)
+    # дешёвый способ посчитать total_pages без отдельного COUNT: если пришло меньше лимита и page==1 — значит всего <= лимит
+    # для простоты сделаем отдельный вызов, если хочешь — добавь count_user_tickets
+    # пока “эмуляция”: если пришло ровно лимит — считаем, что есть следующая страница
+    total_pages = page + (1 if len(rows) == USER_PAGE_SIZE else 0)
+    if page == 1 and total < USER_PAGE_SIZE:
+        total_pages = 1
+
+    lines = ["<b>🎫 Мои обращения</b>"]
+    if not rows:
+        lines.append("Пока пусто. Нажми «➕ Новое обращение».")
+    kb = kb_user_support_home(page, total_pages)
+
+    # вставим тикеты в начало клавиатуры
+    kb.inline_keyboard = [kb_user_ticket_row(r["id"], r["subject"]) for r in rows] + kb.inline_keyboard
+
+    text = "\n".join(lines)
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=kb)
+    else:
+        await target.message.edit_text(text, reply_markup=kb)
+
+# пагинация “Мои обращения”
+@rt.callback_query(F.data.regexp(r"^user:support:list:(\d+)$"))
+async def user_support_list(cb: CallbackQuery):
+    page = max(1, int(cb.data.split(":")[-1]))
+    await _user_support_list_send(cb, page=page)
+    await cb.answer()
+
+# открыть тикет
+@rt.callback_query(F.data.startswith("user:support:open:"))
+async def user_support_open(cb: CallbackQuery):
+    ticket_id = int(cb.data.split(":")[-1])
+    text, is_closed = await render_user_ticket_text(ticket_id, cb.from_user.id)
+    kb = kb_user_ticket_actions(ticket_id, is_closed)
+    await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await cb.answer()
+
+# ответить в тикете — запрос текста
+@rt.callback_query(F.data.startswith("user:support:reply:"))
+async def user_support_reply_prompt(cb: CallbackQuery, state: FSMContext):
+    ticket_id = int(cb.data.split(":")[-1])
+    await state.set_state(SupportDialog.waiting_text)
+    await state.update_data(reply_ticket_id=ticket_id)
+    await cb.message.answer(f"Напиши сообщение для тикета #{ticket_id}:")
+    await cb.answer()
+
+# отправка ответа пользователя
+@rt.message(SupportDialog.waiting_text, F.text.len() > 0)
+async def user_support_reply_send(m: Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("reply_ticket_id")
+    subject = data.get("subject")  # если это создание — тут будет subject
+    text = m.text.strip()
+
+    if ticket_id:
+        ok = await reply_ticket_from_user(ticket_id, m.from_user.id, text)
+        await state.clear()
+        if ok:
+            await m.answer(f"Сообщение добавлено в тикет #{ticket_id}.")
+        else:
+            await m.answer("Не удалось отправить сообщение. Возможно, тикет закрыт.")
+        return
+
+    # иначе — это завершение создания нового тикета (см. ниже “Новое обращение”)
+    if subject:
+        ticket_id = await create_support_ticket(m.from_user.id, subject, text)
+        await state.clear()
+        admin_flag = await is_admin(m.from_user.id)
+        await m.answer(f"✅ Обращение создано: #{ticket_id}", reply_markup=kb_user_main(is_admin=admin_flag))
+        # уведомим админов
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Открыть тикеты", callback_data="support:list:open:1")]
+        ])
+        for admin_id in settings.ADMIN_IDS:
+            try:
+                await m.bot.send_message(
+                    admin_id,
+                    f"<b>Новый тикет</b> #{ticket_id}\n👤 <a href=\"tg://user?id={m.from_user.id}\">{m.from_user.full_name}</a>\n<i>{subject}</i>",
+                    reply_markup=kb
+                )
+            except Exception:
+                pass
+
+# создать новое обращение (мастер из 2 шагов)
+@rt.callback_query(F.data == "user:support:new")
+async def user_support_new(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SupportDialog.waiting_subject)
+    await cb.message.answer("Кратко опиши тему обращения (заголовок):")
+    await cb.answer()
+
+@rt.message(SupportDialog.waiting_subject, F.text.len() > 2)
+async def user_support_new_subject(m: Message, state: FSMContext):
+    await state.update_data(subject=m.text.strip())
+    await m.answer("Опиши подробно проблему/вопрос (сообщение тикета):")
+    await state.set_state(SupportDialog.waiting_text)

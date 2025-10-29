@@ -148,6 +148,15 @@ async def init_models() -> None:
             WHEN duplicate_object THEN NULL;
         END$$;
         """))
+
+        await conn.execute(text("""
+        DO $$
+        BEGIN
+            CREATE TYPE ticket_status AS ENUM ('open','pending_user','answered','closed');
+        EXCEPTION
+            WHEN duplicate_object THEN NULL;
+        END$$;
+        """))
         # create_all с checkfirst не трогает существующие таблицы/данные
         await conn.run_sync(Base.metadata.create_all)
 
@@ -546,3 +555,224 @@ async def get_peer_owned_by(peer_id: int, owner_tg_id: int):
         if d.get("allowed_cidr") is not None:
             d["allowed_cidr"] = str(d["allowed_cidr"])
         return d
+    
+# ───────────────────────────────── Support models ─────────────────────────────────
+
+TicketStatus = Enum(
+    "open", "pending_user", "answered", "closed",
+    name="ticket_status",
+    create_type=False,
+)
+
+class SupportTicket(Base):
+    __tablename__ = "support_tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_by: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=False
+    )
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(TicketStatus, nullable=False, server_default="open")
+    assignee_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("users.tg_id"), nullable=True
+    )
+    last_activity_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    creator: Mapped[User] = relationship(foreign_keys=[created_by])
+    assignee: Mapped[Optional[User]] = relationship(foreign_keys=[assignee_id])
+
+    __table_args__ = (
+        Index("ix_support_tickets_status", "status"),
+        Index("ix_support_tickets_assignee", "assignee_id"),
+        Index("ix_support_tickets_last_activity", "last_activity_at"),
+    )
+
+class SupportMessage(Base):
+    __tablename__ = "support_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(Integer, ForeignKey("support_tickets.id", ondelete="CASCADE"), nullable=False)
+    sender_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.tg_id", ondelete="SET NULL"))
+    sender_is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=expression.false())
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_support_messages_ticket", "ticket_id"),
+        Index("ix_support_messages_created_at", "created_at"),
+    )
+
+# ───────────────────────────────── Support CRUD ─────────────────────────────────
+
+async def create_support_ticket(user_id: int, subject: str, text: str) -> int:
+    async with SessionLocal() as s:
+        t = SupportTicket(created_by=user_id, subject=subject, status="open")
+        s.add(t)
+        await s.flush()
+        s.add(SupportMessage(ticket_id=t.id, sender_id=user_id, sender_is_admin=False, text=text))
+        await s.execute(update(SupportTicket).where(SupportTicket.id == t.id)
+                        .values(last_activity_at=func.now()))
+        await s.commit()
+        return t.id
+
+async def list_tickets_admin(status: Optional[str], limit: int, offset: int):
+    async with SessionLocal() as s:
+        q = select(
+            SupportTicket.id, SupportTicket.subject, SupportTicket.status,
+            SupportTicket.created_by, SupportTicket.assignee_id, SupportTicket.last_activity_at,
+            User.username.label("creator_username"), User.first_name.label("creator_first"), User.last_name.label("creator_last")
+        ).join(User, User.tg_id == SupportTicket.created_by)
+        if status:
+            q = q.where(SupportTicket.status == status)
+        q = q.order_by(SupportTicket.last_activity_at.desc()).limit(limit).offset(offset)
+        rows = (await s.execute(q)).mappings().all()
+        return [dict(r) for r in rows]
+
+async def count_tickets(status: Optional[str]) -> int:
+    async with SessionLocal() as s:
+        q = select(func.count()).select_from(SupportTicket)
+        if status:
+            q = q.where(SupportTicket.status == status)
+        return int((await s.execute(q)).scalar() or 0)
+
+async def get_ticket(ticket_id: int):
+    async with SessionLocal() as s:
+        t = await s.get(SupportTicket, ticket_id)
+        if not t:
+            return None
+        creator = await s.get(User, t.created_by)
+        assignee = await s.get(User, t.assignee_id) if t.assignee_id else None
+        msgs = (await s.execute(
+            select(SupportMessage).where(SupportMessage.ticket_id == ticket_id).order_by(SupportMessage.id.asc())
+        )).scalars().all()
+        return {
+            "id": t.id,
+            "subject": t.subject,
+            "status": t.status,
+            "created_by": t.created_by,
+            "assignee_id": t.assignee_id,
+            "last_activity_at": t.last_activity_at,
+            "created_at": t.created_at,
+            "creator": creator,
+            "assignee": assignee,
+            "messages": [{"id": m.id, "sender_id": m.sender_id, "sender_is_admin": m.sender_is_admin,
+                          "text": m.text, "created_at": m.created_at} for m in msgs]
+        }
+
+async def assign_ticket(ticket_id: int, admin_id: int) -> bool:
+    async with SessionLocal() as s:
+        t = await s.get(SupportTicket, ticket_id)
+        if not t or t.status == "closed":
+            return False
+        t.assignee_id = admin_id
+        await s.commit()
+        return True
+
+async def close_ticket(ticket_id: int, admin_id: int) -> bool:
+    async with SessionLocal() as s:
+        t = await s.get(SupportTicket, ticket_id)
+        if not t or t.status == "closed":
+            return False
+        t.status = "closed"
+        t.assignee_id = t.assignee_id or admin_id
+        await s.commit()
+        return True
+
+async def reply_ticket_from_admin(ticket_id: int, admin_id: int, text_: str) -> Optional[int]:
+    async with SessionLocal() as s:
+        t = await s.get(SupportTicket, ticket_id)
+        if not t or t.status == "closed":
+            return None
+        s.add(SupportMessage(ticket_id=ticket_id, sender_id=admin_id, sender_is_admin=True, text=text_))
+        t.assignee_id = t.assignee_id or admin_id
+        # после ответа админа переводим в "pending_user"
+        t.status = "pending_user"
+        await s.execute(update(SupportTicket).where(SupportTicket.id == ticket_id)
+                        .values(last_activity_at=func.now()))
+        await s.commit()
+        return t.created_by
+
+async def reply_ticket_from_user(ticket_id: int, user_id: int, text_: str) -> bool:
+    async with SessionLocal() as s:
+        t = await s.get(SupportTicket, ticket_id)
+        if not t or t.created_by != user_id or t.status == "closed":
+            return False
+        s.add(SupportMessage(ticket_id=ticket_id, sender_id=user_id, sender_is_admin=False, text=text_))
+        # после ответа пользователя— тикет снова "open" либо "answered" (на выбор).
+        # Оставим "open" чтобы попадал в список необработанных.
+        t.status = "open"
+        await s.execute(update(SupportTicket).where(SupportTicket.id == ticket_id)
+                        .values(last_activity_at=func.now()))
+        await s.commit()
+        return True
+
+async def list_user_tickets(user_id: int, limit: int = 20, offset: int = 0):
+    async with SessionLocal() as s:
+        rows = (await s.execute(
+            select(SupportTicket.id, SupportTicket.subject, SupportTicket.status, SupportTicket.last_activity_at)
+            .where(SupportTicket.created_by == user_id)
+            .order_by(SupportTicket.last_activity_at.desc())
+            .limit(limit).offset(offset)
+        )).all()
+        return [{"id": r.id, "subject": r.subject, "status": r.status, "last_activity_at": r.last_activity_at} for r in rows]
+
+async def count_ticket_users(status: str | None = None) -> int:
+    async with SessionLocal() as s:
+        q = select(func.count(func.distinct(SupportTicket.created_by)))
+        if status:
+            q = q.where(SupportTicket.status == status)
+        return int((await s.execute(q)).scalar() or 0)
+
+async def list_ticket_users(status: str | None, limit: int, offset: int):
+    """
+    Список авторов, у которых есть тикеты (счётчики и последняя активность).
+    Возвращает [{user_id, username, first_name, last_name, total, open, pending_user, answered, closed, last_activity_at}]
+    """
+    async with SessionLocal() as s:
+        # подзапрос: агрегируем по пользователю
+        base = select(
+            SupportTicket.created_by.label("uid"),
+            func.count().label("total"),
+            func.count().filter(SupportTicket.status == "open").label("open"),
+            func.count().filter(SupportTicket.status == "pending_user").label("pending_user"),
+            func.count().filter(SupportTicket.status == "answered").label("answered"),
+            func.count().filter(SupportTicket.status == "closed").label("closed"),
+            func.max(SupportTicket.last_activity_at).label("last_activity_at"),
+        )
+        if status:
+            base = base.where(SupportTicket.status == status)
+        base = base.group_by(SupportTicket.created_by).subquery()
+
+        q = (
+            select(
+                base.c.uid,
+                base.c.total, base.c.open, base.c.pending_user, base.c.answered, base.c.closed,
+                base.c.last_activity_at,
+                User.username, User.first_name, User.last_name
+            )
+            .join(User, User.tg_id == base.c.uid, isouter=True)
+            .order_by(base.c.last_activity_at.desc())
+            .limit(limit).offset(offset)
+        )
+
+        rows = (await s.execute(q)).mappings().all()
+        return [dict(r) for r in rows]
+
+async def count_tickets_by_user(user_id: int, status: str | None = None) -> int:
+    async with SessionLocal() as s:
+        q = select(func.count()).select_from(SupportTicket).where(SupportTicket.created_by == user_id)
+        if status:
+            q = q.where(SupportTicket.status == status)
+        return int((await s.execute(q)).scalar() or 0)
+
+async def list_tickets_by_user(user_id: int, status: str | None, limit: int, offset: int):
+    async with SessionLocal() as s:
+        q = select(
+            SupportTicket.id, SupportTicket.subject, SupportTicket.status, SupportTicket.last_activity_at
+        ).where(SupportTicket.created_by == user_id)
+        if status:
+            q = q.where(SupportTicket.status == status)
+        q = q.order_by(SupportTicket.last_activity_at.desc()).limit(limit).offset(offset)
+        rows = (await s.execute(q)).mappings().all()
+        return [dict(r) for r in rows]
