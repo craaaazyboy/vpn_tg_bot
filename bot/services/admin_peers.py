@@ -34,7 +34,7 @@ async def open_peer_text_and_kb(peer_id: int) -> Tuple[str, InlineKeyboardMarkup
     except Exception:
         pass
 
-    return render_peer_card_text(row), kb_peer_card_safe(row["tg_user"], row["id"])
+    return render_peer_card_text(row), kb_peer_card_safe(row["tg_user"], row["id"], row["username"])
 
 async def do_revoke(peer_id: int, actor_id: int) -> str:
     row = await get_peer_by_id(peer_id)
