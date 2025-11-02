@@ -46,7 +46,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: root  
           key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          port: 22
           script: |
             set -e
             cd /opt/vpn-tg-bot/vpn_tg_bot
