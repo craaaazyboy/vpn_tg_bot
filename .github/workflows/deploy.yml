@@ -36,28 +36,28 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
 
- deploy:
-  needs: build-and-push
-  runs-on: ubuntu-latest
-  steps:
-    - name: Validate secrets
-      run: |
-        test -n "${{ secrets.SSH_HOST }}" || (echo "Missing SSH_HOST" && exit 1)
-        test -n "${{ secrets.SSH_KEY }}"  || (echo "Missing SSH_KEY" && exit 1)
-        test -n "${{ secrets.GHCR_READ_TOKEN }}" || (echo "Missing GHCR_READ_TOKEN" && exit 1)
-        test -n "${{ secrets.GH_USER }}" || (echo "Missing GH_USER (должен быть ваш GitHub username)" && exit 1)
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate secrets
+        run: |
+          test -n "${{ secrets.SSH_HOST }}" || (echo "Missing SSH_HOST" && exit 1)
+          test -n "${{ secrets.SSH_KEY }}"  || (echo "Missing SSH_KEY" && exit 1)
+          test -n "${{ secrets.GHCR_READ_TOKEN }}" || (echo "Missing GHCR_READ_TOKEN" && exit 1)
+          test -n "${{ secrets.GH_USER }}" || (echo "Missing GH_USER (ваш GitHub username)" && exit 1)
 
-    - name: SSH deploy (garygrossgarten)
-      uses: garygrossgarten/github-action-ssh@release
-      with:
-        host: ${{ secrets.SSH_HOST }}
-        username: root                            # если не root — замени/вынеси в секрет
-        privateKey: ${{ secrets.SSH_KEY }}        # приватный OpenSSH ключ (BEGIN/END)
-        port: 22       # если порт нестандартный — создай секрет SSH_PORT, иначе поставь число 22
-        command: |
-          set -e
-          cd /opt/vpn-tg-bot/vpn_tg_bot
-          echo "${{ secrets.GHCR_READ_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GH_USER }}" --password-stdin
-          docker compose -f docker-compose.prod.yml pull
-          docker compose -f docker-compose.prod.yml up -d
-          docker image prune -f
+      - name: SSH deploy
+        uses: garygrossgarten/github-action-ssh@release
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: root
+          privateKey: ${{ secrets.SSH_KEY }}
+          port: 22 # если не 22, создай секрет SSH_PORT и поставь: ${{ secrets.SSH_PORT }}
+          command: |
+            set -e
+            cd /opt/vpn-tg-bot/vpn_tg_bot
+            echo "${{ secrets.GHCR_READ_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GH_USER }}" --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+            docker image prune -f
