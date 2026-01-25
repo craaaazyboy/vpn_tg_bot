@@ -11,7 +11,8 @@ from state import RequestPeer, SupportDialog
 from keyboards import kb_user_main
 from db import (
     upsert_user, is_admin, create_access_request,
-    list_user_peers, get_peer_owned_by, create_support_ticket, list_user_tickets, reply_ticket_from_user
+    list_user_peers, get_peer_owned_by,
+    create_support_ticket, list_user_tickets, reply_ticket_from_user,
 )
 from services.wireguard import fetch_client_conf_and_qr, wg_dump_stats
 from settings import settings
