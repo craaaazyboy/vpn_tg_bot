@@ -48,6 +48,7 @@ jobs:
             ssh_host_secret: SSH_HOST_DEV
             ssh_key_secret: SSH_KEY_DEV
             ssh_port_secret: SSH_PORT_DEV
+            ssh_user_secret: SSH_USER_DEV
             ghcr_read_secret: GHCR_READ_TOKEN_DEV
             gh_user_secret: GH_USER_DEV
           - env: stage
@@ -59,6 +60,7 @@ jobs:
             ssh_host_secret: SSH_HOST_STAGE
             ssh_key_secret: SSH_KEY_STAGE
             ssh_port_secret: SSH_PORT_STAGE
+            ssh_user_secret: SSH_USER_STAGE
             ghcr_read_secret: GHCR_READ_TOKEN_STAGE
             gh_user_secret: GH_USER_STAGE
           - env: prod
@@ -70,6 +72,7 @@ jobs:
             ssh_host_secret: SSH_HOST
             ssh_key_secret: SSH_KEY
             ssh_port_secret: SSH_PORT
+            ssh_user_secret: SSH_USER
             ghcr_read_secret: GHCR_READ_TOKEN
             gh_user_secret: GH_USER
     environment:
@@ -116,7 +119,8 @@ jobs:
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets[matrix.ssh_host_secret] }}
-          username: root
+          # default root, override with SSH_USER_* secret if нужен другой пользователь
+          username: ${{ secrets[matrix.ssh_user_secret] || 'root' }}
           key: ${{ secrets[matrix.ssh_key_secret] }}
           # If no custom port secret, appleboy/ssh-action defaults to 22.
           port: ${{ secrets[matrix.ssh_port_secret] }}
