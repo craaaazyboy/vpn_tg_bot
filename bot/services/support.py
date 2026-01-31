@@ -23,10 +23,16 @@ async def render_ticket_text(ticket_id: int) -> Tuple[str, bool, bool]:
     t = await get_ticket(ticket_id)
     if not t:
         return "Тикет не найден.", False, True
+    assignee_text = "—"
+    if t.get("assignee"):
+        if getattr(t["assignee"], "username", None):
+            assignee_text = f"@{t['assignee'].username}"
+        else:
+            assignee_text = t["assignee"].first_name or "—"
     head = (f"<b>#{t['id']}</b> • <i>{t['subject']}</i>\n"
             f"Статус: <b>{status_human(t['status'])}</b>\n"
             f"Автор: <a href=\"tg://user?id={t['created_by']}\">{t['creator'].first_name or 'user'}</a>\n"
-            f"Исполнитель: {(f'@{t['assignee'].username}' if t['assignee'] and t['assignee'].username else ('—' if not t['assignee'] else t['assignee'].first_name or '—'))}")
+            f"Исполнитель: {assignee_text}")
     body = []
     for m in t["messages"]:
         who = "👮‍♂️" if m["sender_is_admin"] else "👤"

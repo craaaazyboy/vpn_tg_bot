@@ -1,11 +1,12 @@
 from __future__ import annotations
-
+import secrets
+from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from typing import Optional, List, Dict, Any, Tuple
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, JSON,
+    BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, JSON, LargeBinary,
     Text, UniqueConstraint, Index, select, update, func, and_, or_, text
 )
 from sqlalchemy.dialects.postgresql import CIDR
@@ -114,6 +115,32 @@ class AccessRequest(Base):
     decided_at: Mapped[Optional[Any]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+
+class Ikev2Request(Base):
+    __tablename__ = "ikev2_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tg_user: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)  # ios|android
+    device_name: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")  # pending/approved/rejected
+    decided_by: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.tg_id"))
+    decided_at: Mapped[Optional[Any]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class Ikev2Account(Base):
+    __tablename__ = "ikev2_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tg_user: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)  # ios|android
+    device_name: Mapped[str] = mapped_column(Text, nullable=False)
+    username: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")  # active/revoked
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    revoked_at: Mapped[Optional[Any]] = mapped_column(DateTime(timezone=True))
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
 
@@ -124,6 +151,19 @@ class AuditLog(Base):
     details: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+class Download(Base):
+    __tablename__ = "downloads"
+
+    token: Mapped[str] = mapped_column(Text, primary_key=True)  # одноразовый/временный токен
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    mime: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)  # BYTEA
+    expires_at: Mapped[Any] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_downloads_expires_at", "expires_at"),
+    )
 # ───────────────────────────────── Init (без потери данных) ─────────────────────────────────
 
 async def _ensure_pg_enum(session: AsyncSession) -> None:
@@ -477,6 +517,217 @@ async def decide_access_request(req_id: int, decided_by: int, status: str) -> No
         )
         await s.commit()
 
+
+# ikev2_requests
+async def create_ikev2_request(tg_user: int, platform: str, device_name: str) -> int:
+    assert platform in ("ios", "android")
+    async with SessionLocal() as s:
+        ar = Ikev2Request(tg_user=tg_user, platform=platform, device_name=device_name, status="pending")
+        s.add(ar)
+        await s.flush()
+        rid = ar.id
+        await s.commit()
+        return rid
+
+
+async def get_ikev2_request(req_id: int):
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Ikev2Request, User.username, User.first_name, User.last_name)
+            .join(User, User.tg_id == Ikev2Request.tg_user, isouter=True)
+            .where(Ikev2Request.id == req_id)
+        )
+        row = res.first()
+        if not row:
+            return None
+        ar: Ikev2Request = row[0]
+        return {
+            "id": ar.id,
+            "tg_user": ar.tg_user,
+            "platform": ar.platform,
+            "device_name": ar.device_name,
+            "status": ar.status,
+            "decided_by": ar.decided_by,
+            "decided_at": ar.decided_at,
+            "created_at": ar.created_at,
+            "username": row.username,
+            "first_name": row.first_name,
+            "last_name": row.last_name,
+        }
+
+
+async def list_ikev2_requests(status: str, limit: int, offset: int):
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Ikev2Request, User.username, User.first_name, User.last_name)
+            .join(User, User.tg_id == Ikev2Request.tg_user, isouter=True)
+            .where(Ikev2Request.status == status)
+            .order_by(Ikev2Request.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        rows = []
+        for r in res.all():
+            ar: Ikev2Request = r[0]
+            rows.append(
+                {
+                    "id": ar.id,
+                    "tg_user": ar.tg_user,
+                    "platform": ar.platform,
+                    "device_name": ar.device_name,
+                    "status": ar.status,
+                    "decided_by": ar.decided_by,
+                    "decided_at": ar.decided_at,
+                    "created_at": ar.created_at,
+                    "username": r.username,
+                    "first_name": r.first_name,
+                    "last_name": r.last_name,
+                }
+            )
+        return rows
+
+
+async def count_ikev2_requests(status: str) -> int:
+    async with SessionLocal() as s:
+        res = await s.execute(select(func.count()).select_from(Ikev2Request).where(Ikev2Request.status == status))
+        return int(res.scalar() or 0)
+
+
+async def decide_ikev2_request(req_id: int, decided_by: int, status: str) -> None:
+    assert status in ("approved", "rejected")
+    async with SessionLocal() as s:
+        await s.execute(
+            update(Ikev2Request)
+            .where(and_(Ikev2Request.id == req_id, Ikev2Request.status == "pending"))
+            .values(status=status, decided_by=decided_by, decided_at=func.now())
+        )
+        await s.commit()
+
+
+# ikev2_accounts
+async def create_ikev2_account(tg_user: int, platform: str, device_name: str, username: str) -> int:
+    assert platform in ("ios", "android")
+    async with SessionLocal() as s:
+        acc = Ikev2Account(
+            tg_user=tg_user,
+            platform=platform,
+            device_name=device_name,
+            username=username,
+            status="active",
+        )
+        s.add(acc)
+        await s.flush()
+        aid = acc.id
+        await s.commit()
+        return aid
+
+
+async def list_ikev2_accounts_by_user(tg_user: int):
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Ikev2Account)
+            .where(Ikev2Account.tg_user == tg_user)
+            .order_by(Ikev2Account.id.desc())
+        )
+        return [
+            {
+                "id": a.id,
+                "tg_user": a.tg_user,
+                "platform": a.platform,
+                "device_name": a.device_name,
+                "username": a.username,
+                "status": a.status,
+                "created_at": a.created_at,
+                "revoked_at": a.revoked_at,
+            }
+            for a in res.scalars().all()
+        ]
+
+
+async def count_ikev2_accounts(status: str) -> int:
+    async with SessionLocal() as s:
+        res = await s.execute(select(func.count()).select_from(Ikev2Account).where(Ikev2Account.status == status))
+        return int(res.scalar() or 0)
+
+
+async def list_ikev2_accounts_page(status: str, limit: int, offset: int):
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Ikev2Account, User.username, User.first_name, User.last_name)
+            .join(User, User.tg_id == Ikev2Account.tg_user, isouter=True)
+            .where(Ikev2Account.status == status)
+            .order_by(Ikev2Account.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        rows = []
+        for r in res.all():
+            a: Ikev2Account = r[0]
+            rows.append(
+                {
+                    "id": a.id,
+                    "tg_user": a.tg_user,
+                    "platform": a.platform,
+                    "device_name": a.device_name,
+                    "username": a.username,
+                    "status": a.status,
+                    "created_at": a.created_at,
+                    "revoked_at": a.revoked_at,
+                    "user_username": r.username,
+                    "first_name": r.first_name,
+                    "last_name": r.last_name,
+                }
+            )
+        return rows
+
+
+# Backward/compat helpers (expected by handlers)
+async def list_ikev2_accounts(status: str, limit: int, offset: int):
+    return await list_ikev2_accounts_page(status=status, limit=limit, offset=offset)
+
+
+async def get_ikev2_account_owned_by(acc_id: int, tg_user: int):
+    acc = await get_ikev2_account(acc_id)
+    if not acc or acc.get("tg_user") != tg_user:
+        return None
+    return acc
+
+
+async def get_ikev2_account(acc_id: int):
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Ikev2Account, User.username, User.first_name, User.last_name)
+            .join(User, User.tg_id == Ikev2Account.tg_user, isouter=True)
+            .where(Ikev2Account.id == acc_id)
+        )
+        row = res.first()
+        if not row:
+            return None
+        a: Ikev2Account = row[0]
+        return {
+            "id": a.id,
+            "tg_user": a.tg_user,
+            "platform": a.platform,
+            "device_name": a.device_name,
+            "username": a.username,
+            "status": a.status,
+            "created_at": a.created_at,
+            "revoked_at": a.revoked_at,
+            "user_username": row.username,
+            "first_name": row.first_name,
+            "last_name": row.last_name,
+        }
+
+
+async def revoke_ikev2_account(acc_id: int) -> None:
+    async with SessionLocal() as s:
+        await s.execute(
+            update(Ikev2Account)
+            .where(and_(Ikev2Account.id == acc_id, Ikev2Account.status == "active"))
+            .values(status="revoked", revoked_at=func.now())
+        )
+        await s.commit()
+
 async def count_peers(status: str) -> int:
     async with SessionLocal() as s:
         res = await s.execute(
@@ -776,3 +1027,36 @@ async def list_tickets_by_user(user_id: int, status: str | None, limit: int, off
         q = q.order_by(SupportTicket.last_activity_at.desc()).limit(limit).offset(offset)
         rows = (await s.execute(q)).mappings().all()
         return [dict(r) for r in rows]
+
+async def create_download(content: bytes, filename: str, mime: str, ttl_seconds: int = 900) -> str:
+    token = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=ttl_seconds)
+
+    async with SessionLocal() as s:
+        # подчистим истёкшие, чтобы таблица не росла
+        await s.execute(
+            text("DELETE FROM downloads WHERE expires_at < now()")
+        )
+        s.add(Download(token=token, filename=filename, mime=mime, content=content, expires_at=exp))
+        await s.commit()
+
+    return token
+
+async def get_download(token: str) -> Optional[Dict[str, Any]]:
+    async with SessionLocal() as s:
+        row = await s.get(Download, token)
+        if not row:
+            return None
+        # expires_at timezone-aware
+        now = datetime.now(timezone.utc)
+        if row.expires_at < now:
+            return None
+        return {
+            "token": row.token,
+            "filename": row.filename,
+            "mime": row.mime,
+            "content": row.content,
+            "expires_at": row.expires_at,
+            "created_at": row.created_at,
+        }

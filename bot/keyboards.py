@@ -7,6 +7,7 @@ def kb_user_main(is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="🆘 Поддержка")], 
         [KeyboardButton(text="➕ Запросить VPN")],
+        [KeyboardButton(text="🔐 IKEv2/IPsec")],
         [KeyboardButton(text="📦 Мои устройства")],
         [KeyboardButton(text="ℹ️ Помощь")],
     ]
@@ -107,3 +108,16 @@ def kb_ticket_user_tickets_nav(uid: int, status: str | None, page: int, total_pa
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="⬅️ К пользователям", callback_data=f"support:users:{st}:1")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_ikev2_platform() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🍎 iPhone / iPad (iOS)", callback_data="ikev2:platform:ios"),
+        ],
+        [
+            InlineKeyboardButton(text="🤖 Android", callback_data="ikev2:platform:android"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="ikev2:back"),
+        ],
+    ])
