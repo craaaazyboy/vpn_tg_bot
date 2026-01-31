@@ -119,18 +119,20 @@ jobs:
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets[matrix.ssh_host_secret] }}
-          # default root, override with SSH_USER_* secret if нужен другой пользователь
           username: ${{ secrets[matrix.ssh_user_secret] || 'root' }}
           key: ${{ secrets[matrix.ssh_key_secret] }}
-          # If no custom port secret, appleboy/ssh-action defaults to 22.
-          port: ${{ secrets[matrix.ssh_port_secret] }}
+          port: ${{ secrets[matrix.ssh_port_secret] || 22 }}
           script: |
             set -euo pipefail
             cd ${{ matrix.server_path }}
+
             git fetch origin
             git checkout ${{ matrix.branch }}
             git reset --hard origin/${{ matrix.branch }}
+
             echo "${{ secrets[matrix.ghcr_read_secret] }}" | docker login ghcr.io -u "${{ secrets[matrix.gh_user_secret] }}" --password-stdin
-            IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} pull bot
-            IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} up -d
+
+            IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} pull
+            IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} up -d --remove-orphans
+
             docker image prune -f
