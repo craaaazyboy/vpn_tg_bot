@@ -16,7 +16,8 @@ services:
       retries: 10
 
   bot:
-    image: ghcr.io/craaaazyboy/vpn_tg_bot:latest
+    image: ${IMAGE:-ghcr.io/craaaazyboy/vpn_tg_bot}:${TAG:-latest}
+    pull_policy: always
     env_file: .env
     depends_on:
       db:

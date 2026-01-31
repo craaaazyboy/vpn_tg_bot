@@ -2,25 +2,109 @@ name: CI/CD
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+      - stage
+      - dev
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy (dev, stage, prod, all)"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+          - all
 
 env:
   IMAGE: ghcr.io/craaaazyboy/vpn_tg_bot
 
 jobs:
-  build-and-push:
+  build-deploy:
+    name: Build & Deploy (${{ matrix.env }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    concurrency:
+      group: vpn-tg-bot-${{ matrix.env }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            branch: dev
+            environment_name: dev
+            tag_suffix: dev
+            compose_file: docker-compose.prod.yml
+            server_path: /opt/vpn-tg-bot/dev/vpn_tg_bot
+            ssh_host_secret: SSH_HOST_DEV
+            ssh_key_secret: SSH_KEY_DEV
+            ssh_port_secret: SSH_PORT_DEV
+            ghcr_read_secret: GHCR_READ_TOKEN_DEV
+            gh_user_secret: GH_USER_DEV
+          - env: stage
+            branch: stage
+            environment_name: stage
+            tag_suffix: stage
+            compose_file: docker-compose.prod.yml
+            server_path: /opt/vpn-tg-bot/stage/vpn_tg_bot
+            ssh_host_secret: SSH_HOST_STAGE
+            ssh_key_secret: SSH_KEY_STAGE
+            ssh_port_secret: SSH_PORT_STAGE
+            ghcr_read_secret: GHCR_READ_TOKEN_STAGE
+            gh_user_secret: GH_USER_STAGE
+          - env: prod
+            branch: main
+            environment_name: production
+            tag_suffix: prod
+            compose_file: docker-compose.prod.yml
+            server_path: /opt/vpn-tg-bot/prod/vpn_tg_bot
+            ssh_host_secret: SSH_HOST
+            ssh_key_secret: SSH_KEY
+            ssh_port_secret: SSH_PORT
+            ghcr_read_secret: GHCR_READ_TOKEN
+            gh_user_secret: GH_USER
+    environment:
+      name: ${{ matrix.environment_name }}
+
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check if should run
+        id: should_run
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.environment }}" == "${{ matrix.env }}" ]] || [[ "${{ github.event.inputs.environment }}" == "all" ]]; then
+              echo "run=true" >> $GITHUB_OUTPUT
+            else
+              echo "run=false" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            if [[ "${{ github.ref }}" == "refs/heads/${{ matrix.branch }}" ]]; then
+              echo "run=true" >> $GITHUB_OUTPUT
+            else
+              echo "run=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        if: steps.should_run.outputs.run == 'true'
 
-      - name: Login to GHCR
+      - name: Compute tags
+        id: meta
+        run: |
+          echo "TAG_SHA=${GITHUB_SHA}-${{ matrix.tag_suffix }}" >> $GITHUB_OUTPUT
+          echo "TAG_LATEST=${{ matrix.tag_suffix }}-latest" >> $GITHUB_OUTPUT
+
+      - name: Login to GHCR (push)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -33,31 +117,33 @@ jobs:
           context: ./bot
           push: true
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.TAG_LATEST }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.TAG_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Validate secrets
+      - name: Validate secrets for ${{ matrix.env }}
         run: |
-          test -n "${{ secrets.SSH_HOST }}" || (echo "Missing SSH_HOST" && exit 1)
-          test -n "${{ secrets.SSH_KEY }}"  || (echo "Missing SSH_KEY" && exit 1)
-          test -n "${{ secrets.GHCR_READ_TOKEN }}" || (echo "Missing GHCR_READ_TOKEN" && exit 1)
-          test -n "${{ secrets.GH_USER }}" || (echo "Missing GH_USER (ваш GitHub username)" && exit 1)
+          test -n "${{ secrets[matrix.ssh_host_secret] }}" || (echo "Missing ${{ matrix.ssh_host_secret }}" && exit 1)
+          test -n "${{ secrets[matrix.ssh_key_secret] }}"  || (echo "Missing ${{ matrix.ssh_key_secret }}" && exit 1)
+          test -n "${{ secrets[matrix.ghcr_read_secret] }}" || (echo "Missing ${{ matrix.ghcr_read_secret }}" && exit 1)
+          test -n "${{ secrets[matrix.gh_user_secret] }}" || (echo "Missing ${{ matrix.gh_user_secret }} (GitHub username)" && exit 1)
 
-      - name: SSH deploy
-        uses: garygrossgarten/github-action-ssh@release
+      - name: Deploy over SSH (${{ matrix.env }})
+        uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.SSH_HOST }}
+          host: ${{ secrets[matrix.ssh_host_secret] }}
           username: root
-          privateKey: ${{ secrets.SSH_KEY }}
-          port: 22 # если не 22, создай секрет SSH_PORT и поставь: ${{ secrets.SSH_PORT }}
-          command: |
-            set -e
-            cd /opt/vpn-tg-bot/vpn_tg_bot
-            echo "${{ secrets.GHCR_READ_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GH_USER }}" --password-stdin
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d
+          key: ${{ secrets[matrix.ssh_key_secret] }}
+          # If no custom port secret, appleboy/ssh-action defaults to 22.
+          port: ${{ secrets[matrix.ssh_port_secret] }}
+          script: |
+            set -euo pipefail
+            cd ${{ matrix.server_path }}
+            git fetch origin
+            git checkout ${{ matrix.branch }}
+            git reset --hard origin/${{ matrix.branch }}
+            echo "${{ secrets[matrix.ghcr_read_secret] }}" | docker login ghcr.io -u "${{ secrets[matrix.gh_user_secret] }}" --password-stdin
+            IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} pull bot
+            IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} up -d
             docker image prune -f
