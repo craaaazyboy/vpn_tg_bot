@@ -12,10 +12,27 @@ import asyncssh
 from settings import settings
 
 
-def generate_username(prefix: str = "u") -> str:
-    """Generate a short username suitable for strongSwan EAP accounts."""
-    # strongSwan accepts arbitrary strings; keep it short and URL-safe.
-    return f"{prefix}{secrets.randbelow(10**8):08d}"
+import re
+
+def generate_username(tg_user: int | str, device_name: str = "", suffix_len: int = 4) -> str:
+    """
+    Генерирует username для strongSwan.
+    Пример: u123456789_macbook_air_ab12
+    """
+    # tg_user может быть int (telegram id) или строка
+    base = str(tg_user)
+
+    dev = (device_name or "").strip().lower()
+    dev = re.sub(r"[^a-z0-9]+", "_", dev)  # только латиница/цифры/_
+    dev = dev.strip("_")[:20]              # ограничим длину
+
+    alphabet = string.ascii_lowercase + string.digits
+    suf = "".join(secrets.choice(alphabet) for _ in range(max(2, int(suffix_len))))
+
+    if dev:
+        return f"u{base}_{dev}_{suf}"
+    return f"u{base}_{suf}"
+
 
 
 def generate_password(length: int = 20) -> str:
@@ -54,7 +71,8 @@ async def _ssh_run(cmd: str) -> str:
 
 
 def _helper() -> str:
-    return settings.IKEV2_SERVER_MANAGER or "/usr/local/sbin/ikev2.sh"
+    return getattr(settings, "IKEV2_SERVER_MANAGER", None) or "/usr/local/sbin/ikev2.sh"
+
 
 
 async def ensure_user_on_server(username: str, password: str) -> None:

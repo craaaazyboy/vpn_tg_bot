@@ -1,11 +1,12 @@
 from __future__ import annotations
-
+import secrets
+from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from typing import Optional, List, Dict, Any, Tuple
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, JSON,
+    BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, JSON, LargeBinary,
     Text, UniqueConstraint, Index, select, update, func, and_, or_, text
 )
 from sqlalchemy.dialects.postgresql import CIDR
@@ -150,6 +151,19 @@ class AuditLog(Base):
     details: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+class Download(Base):
+    __tablename__ = "downloads"
+
+    token: Mapped[str] = mapped_column(Text, primary_key=True)  # одноразовый/временный токен
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    mime: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)  # BYTEA
+    expires_at: Mapped[Any] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_downloads_expires_at", "expires_at"),
+    )
 # ───────────────────────────────── Init (без потери данных) ─────────────────────────────────
 
 async def _ensure_pg_enum(session: AsyncSession) -> None:
@@ -1013,3 +1027,36 @@ async def list_tickets_by_user(user_id: int, status: str | None, limit: int, off
         q = q.order_by(SupportTicket.last_activity_at.desc()).limit(limit).offset(offset)
         rows = (await s.execute(q)).mappings().all()
         return [dict(r) for r in rows]
+
+async def create_download(content: bytes, filename: str, mime: str, ttl_seconds: int = 900) -> str:
+    token = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=ttl_seconds)
+
+    async with SessionLocal() as s:
+        # подчистим истёкшие, чтобы таблица не росла
+        await s.execute(
+            text("DELETE FROM downloads WHERE expires_at < now()")
+        )
+        s.add(Download(token=token, filename=filename, mime=mime, content=content, expires_at=exp))
+        await s.commit()
+
+    return token
+
+async def get_download(token: str) -> Optional[Dict[str, Any]]:
+    async with SessionLocal() as s:
+        row = await s.get(Download, token)
+        if not row:
+            return None
+        # expires_at timezone-aware
+        now = datetime.now(timezone.utc)
+        if row.expires_at < now:
+            return None
+        return {
+            "token": row.token,
+            "filename": row.filename,
+            "mime": row.mime,
+            "content": row.content,
+            "expires_at": row.expires_at,
+            "created_at": row.created_at,
+        }
