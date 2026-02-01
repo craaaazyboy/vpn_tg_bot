@@ -32,9 +32,6 @@ jobs:
     concurrency:
       group: vpn-tg-bot-${{ matrix.env }}
       cancel-in-progress: false
-    if: |
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == matrix.env || github.event.inputs.environment == 'all')) ||
-      (github.event_name == 'push' && github.ref == format('refs/heads/{0}', matrix.branch))
     strategy:
       fail-fast: false
       matrix:
@@ -82,19 +79,52 @@ jobs:
       name: ${{ matrix.environment_name }}
 
     steps:
+      # --- Gate: выполняем только для нужной ветки/выбора env ---
+      - name: Decide whether to run for this matrix entry
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHOULD_RUN="false"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.environment }}" == "${{ matrix.env }}" || "${{ github.event.inputs.environment }}" == "all" ]]; then
+              SHOULD_RUN="true"
+            fi
+          fi
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # github.ref looks like refs/heads/<branch>
+            if [[ "${{ github.ref }}" == "refs/heads/${{ matrix.branch }}" ]]; then
+              SHOULD_RUN="true"
+            fi
+          fi
+
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Skip notice
+        if: steps.gate.outputs.should_run != 'true'
+        run: |
+          echo "Skipping matrix=${{ matrix.env }} for event=${{ github.event_name }} ref=${{ github.ref }}"
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.should_run == 'true'
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.should_run == 'true'
 
       - name: Compute tags
         id: meta
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           echo "TAG_SHA=${GITHUB_SHA}-${{ matrix.tag_suffix }}" >> $GITHUB_OUTPUT
           echo "TAG_LATEST=${{ matrix.tag_suffix }}-latest" >> $GITHUB_OUTPUT
 
       - name: Login to GHCR (push)
         uses: docker/login-action@v3
+        if: steps.gate.outputs.should_run == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -102,6 +132,7 @@ jobs:
 
       - name: Build and push app image
         uses: docker/build-push-action@v6
+        if: steps.gate.outputs.should_run == 'true'
         with:
           context: ./bot
           push: true
@@ -112,6 +143,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Validate infra secrets for ${{ matrix.env }}
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           test -n "${{ secrets[matrix.ssh_host_secret] }}" || (echo "Missing ${{ matrix.ssh_host_secret }}" && exit 1)
           test -n "${{ secrets[matrix.ssh_key_secret] }}"  || (echo "Missing ${{ matrix.ssh_key_secret }}" && exit 1)
@@ -119,6 +151,7 @@ jobs:
           test -n "${{ secrets[matrix.gh_user_secret] }}" || (echo "Missing ${{ matrix.gh_user_secret }} (GitHub username)" && exit 1)
 
       - name: Validate app env secrets for ${{ matrix.env }}
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           test -n "${{ secrets.BOT_TOKEN }}" || (echo "Missing BOT_TOKEN in Environment secrets" && exit 1)
           test -n "${{ secrets.PG_USER }}" || (echo "Missing PG_USER in Environment secrets" && exit 1)
@@ -130,6 +163,7 @@ jobs:
 
       - name: Deploy over SSH (${{ matrix.env }})
         uses: appleboy/ssh-action@v1.0.0
+        if: steps.gate.outputs.should_run == 'true'
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
@@ -158,13 +192,11 @@ jobs:
             git checkout ${{ matrix.branch }}
             git reset --hard origin/${{ matrix.branch }}
 
-            # 1) ключ WG (как "docker secret" файл на сервере, генерится автоматом)
             umask 077
             mkdir -p secrets
             echo "$WG_SSH_PRIVATE_KEY_B64" | base64 -d > secrets/id_ed25519
             chmod 600 secrets/id_ed25519
 
-            # 2) генерим .env (на сервере руками больше не правишь)
             umask 077
             cat > .env <<EOF
             BOT_TOKEN=${BOT_TOKEN}
@@ -184,7 +216,6 @@ jobs:
             WG_SSH_KEY=/run/secrets/vpn_ssh_key
             EOF
 
-            # 3) pull + up
             echo "${{ secrets[matrix.ghcr_read_secret] }}" | docker login ghcr.io -u "${{ secrets[matrix.gh_user_secret] }}" --password-stdin
             IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} pull
             IMAGE=${IMAGE} TAG=${{ steps.meta.outputs.TAG_SHA }} docker compose -f ${{ matrix.compose_file }} up -d --remove-orphans
