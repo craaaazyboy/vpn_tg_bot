@@ -194,7 +194,7 @@ jobs:
 
             umask 077
             mkdir -p secrets
-            echo "$WG_SSH_PRIVATE_KEY_B64" | base64 -d > secrets/id_ed25519
+            printf '%s' "$WG_SSH_PRIVATE_KEY_B64" | tr -d '\r\n\t ' | base64 -d > secrets/id_ed25519
             chmod 600 secrets/id_ed25519
 
             umask 077
