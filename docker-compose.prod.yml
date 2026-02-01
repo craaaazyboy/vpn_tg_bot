@@ -23,8 +23,12 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
-    volumes:
-      - ./secrets/id_ed25519:/run/secrets/vpn_ssh_key:ro
+    secrets:
+      - vpn_ssh_key
+
+secrets:
+  vpn_ssh_key:
+    file: ./secrets/id_ed25519
 
 volumes:
   pg-data:
