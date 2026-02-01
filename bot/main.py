@@ -19,8 +19,7 @@ from handlers import user as user_handlers
 from handlers import admin as admin_handlers
 from state import RequestPeer
 from services.wireguard import add_peer, fetch_client_conf_and_qr
-from db import insert_peer, upsert_user
-
+from db import insert_peer, upsert_user, init_models
 
 # ──────────────────────────── Логирование ────────────────────────────────
 logging.basicConfig(
@@ -134,6 +133,8 @@ async def admin_decision(cb: CallbackQuery):
 # ───────────────────────────── main() ────────────────────────────────────
 async def main():
     try:
+        await init_models()
+
         logging.info("🔄 Удаляем вебхук и сбрасываем апдейты…")
         await bot.delete_webhook(drop_pending_updates=True)
 
