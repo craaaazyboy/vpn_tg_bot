@@ -85,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
+          IMAGE="ghcr.io/craaaazyboy/vpn_tg_bot"
           SHOULD_RUN="false"
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
