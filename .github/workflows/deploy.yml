@@ -192,10 +192,10 @@ jobs:
             git checkout ${{ matrix.branch }}
             git reset --hard origin/${{ matrix.branch }}
 
-            umask 077
-            mkdir -p secrets
-            printf '%s' "$WG_SSH_PRIVATE_KEY_B64" | tr -d '\r\n\t ' | base64 -d > secrets/id_ed25519
-            chmod 600 secrets/id_ed25519
+            # umask 077
+            # mkdir -p secrets
+            # printf '%s' "$WG_SSH_PRIVATE_KEY_B64" | tr -d '\r\n\t ' | base64 -d > secrets/id_ed25519
+            # chmod 600 secrets/id_ed25519
 
             umask 077
             cat > .env <<EOF
